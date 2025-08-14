@@ -1,0 +1,8 @@
+flask
+flask-cors
+flasgger
+python-dotenv
+requests
+beautifulsoup4
+pymongo
+redis
