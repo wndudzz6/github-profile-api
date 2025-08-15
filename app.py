@@ -6,12 +6,22 @@ from flasgger import Swagger
 from flask_cors import CORS
 
 from github_service import fetch_user_via_api, fetch_user_via_scrape
-from cache_redis import cache_get, cache_put
-import json  # 🔧 raw_json을 위해 필요
+from endpoint_cache import get_profile_cache, set_profile_cache  # ✅ 추가
 
 app = Flask(__name__)
 CORS(app)
-swagger = Swagger(app)
+
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {"endpoint": "apispec_1", "route": "/apispec_1.json",
+         "rule_filter": lambda rule: True, "model_filter": lambda tag: True}
+    ],
+    "static_url_path": "/flasgger_static",
+    "swagger_ui": True,
+    "specs_route": "/apidocs/",
+}
+swagger = Swagger(app, config=swagger_config)
 
 @app.route("/")
 def index():
@@ -32,59 +42,53 @@ def profile_api():
         in: query
         type: string
         required: false
-        default: api
         enum: [api, scrape]
+        default: api
         description: 조회 방식
     responses:
       200:
-        description: 유저 정보 반환 성공
+        description: 사용자 정보 반환
     """
-    username = (request.args.get("username") or "").strip()
-    method = (request.args.get("method") or "api").lower()
+    try:
+        username = (request.args.get("username") or "").strip()
+        if not username:
+            return jsonify({"error": "username 파라미터가 없습니다."}), 400
 
-    if not username:
-        return jsonify({"error": "username query param required"}), 400
+        method = (request.args.get("method") or "api").strip().lower()
+        if method not in ("api", "scrape"):
+            method = "api"
 
-    print(f"🔍 요청 수신: username={username}, method={method}")
-    params = {"username": username}
-    url = f"https://api.github.com/users/{username}"
+        # ✅ 1) 캐시 조회
+        cached = get_profile_cache(method, username)
+        if cached:
+            return jsonify(cached), 200
 
-    if method == "scrape":
-        print("🕸️ 스크래핑 방식 사용 중")
-        data, err, rate_msg, details = fetch_user_via_scrape(username)
-    else:
-        cached_body, _ = cache_get(url, params)  # ✅ 순서 수정!
-        if cached_body:
-            print("📦 캐시 HIT → 응답 반환")
-            return jsonify({
-                "data": cached_body,
-                "error": None,
-                "details": {},
-                "method": method,
-                "rate_info": "from-cache",
-                "raw_json": json.dumps(cached_body, ensure_ascii=False)  # ✅ 안정화
-            })
+        # ✅ 2) 실조회
+        if method == "scrape":
+            view, err, rate_msg, raw = fetch_user_via_scrape(username)
+        else:
+            view, err, rate_msg, raw = fetch_user_via_api(username)
 
-        print("🧪 캐시 MISS → API 호출 시도")
-        data, err, rate_msg, details = fetch_user_via_api(username)
-        print(f"🔍 API 호출 결과: data={'✅ 있음' if data else '❌ 없음'}, err={err}")
+        # 상태코드
+        status = 404 if (view is None and err and "찾을 수 없" in str(err)) else (200 if view else 502)
 
-        if data and not err:
-            print("✅ 캐시 저장 시도")
-            cache_put(url, params, data)
+        # ✅ 3) 응답 조립 (언어 통계 없음)
+        resp = {
+            "data": view or {},
+            "error": err,
+            "method": method,
+            "rate_limit": {"message": rate_msg} if rate_msg else {},
+            "details": {"raw_json": raw if isinstance(raw, dict) else None},
+        }
 
-    # ⚠️ Swagger 파싱 오류 방지를 위한 타입 안정화
-    safe_details = details if isinstance(details, dict) else {}
-    safe_raw_json = json.dumps(details, ensure_ascii=False) if isinstance(details, dict) else None
+        # ✅ 4) 캐시 저장 (5분 기본)
+        set_profile_cache(method, username, resp)
 
-    return jsonify({
-        "data": data,
-        "error": err,
-        "details": safe_details,
-        "method": method,
-        "rate_info": rate_msg,
-        "raw_json": safe_raw_json
-    })
+        return jsonify(resp), status
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": f"{type(e).__name__}: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
